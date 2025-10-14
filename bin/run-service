@@ -1,0 +1,50 @@
+#!/bin/sh
+
+# run-service: Run a command or script as a service.
+
+# This script is intended to be used in containers to run services under systemd.  It allows environment variables
+# to be set on the docker/podman command line and then referenced in an application.  It does this by storing them
+# in a environment file and creating a companion service.  If systemd is not running --- which would be typical
+# in a container --- the systemd executable is exec'd making it process 1.
+
+# This is useful for running complex applications that require systemd and/or environment variables.  The application
+# does not have to define a service, one is created to run it automatically.
+
+# A variable INIT may be set to no or false to indicate that the command is to be run directly without systemd.  This is useful for
+# testing the same container application with and without systemd.
+
+if xargs --arg-file=/proc/1/cmdline -0 -n1 | grep /systemd$ >/dev/null 2>&1 ; then
+	echo "Error: SystemD is already running!"
+	exit 1
+fi
+
+# If INIT=No is specified, run inline.
+if echo "${INIT}" | grep -Ei '^no$|^n$|^false$|^fals$|^fal$|^fa$|^f$' >/dev/null 2>&1 ; then
+	echo "Info: Executing command inline."
+	"$@"
+	exit $?
+fi
+
+SERVICE_NAME=$(basename "$0")
+ENV_FILE="/etc/default/$SERVICE_NAME"
+[ -d /etc/sysconfig ] && ENV_FILE="/etc/sysconfig/$SERVICE_NAME"
+
+# Store the environment into an EnvironmentFile for the service.
+xargs -0 -L1 </proc/self/environ >"${ENV_FILE}"
+  
+cat >"/usr/lib/systemd/system/${SERVICE_NAME}.service" <<-__EOD__
+	[Unit]
+	Description=Run command as service.
+	[Service]
+	EnvironmentFile=-${ENV_FILE}
+	ExecStart=$@
+	[Install]
+	WantedBy=multi-user.target
+	__EOD__
+
+systemctl enable "${SERVICE_NAME}.service"
+
+SYSTEMD="/lib/systemd/systemd"
+[ -x /sbin/init ] && SYSTEMD="/sbin/init"
+exec "$SYSTEMD"
+

@@ -1,0 +1,163 @@
+#!/bin/sh
+
+# system-unit-test: Automated System Unit Test script for Samba File Server.
+
+# Test counters.
+tests=0
+passed=0
+errs=0
+
+log_test() {
+	tests=$((tests+1))
+	if [ "${rc:-0}" = "0" ]; then
+		passed=$((passed+1))
+		[ -n "$*" ] && echo "$1 test passed!"
+	else
+		errs=$((errs+1))
+		[ -n "$*" ] && echo "$1 test failed!"
+	fi
+	rc=
+}
+
+report_test_stats() {
+
+	echo "Test results:"
+	echo "$tests tests run."
+	echo "$passed tests passed."
+	if [ "$errs" != "0" ]; then
+		echo "$errs tests failed!"
+		rc="1"
+	fi
+	echo
+}
+
+quit() {
+
+	echo >/sut/samba.stop
+	echo >/sut/files.stop
+}
+
+abort() {
+	echo "Error: Aborting!"
+	quit
+	exit 1
+}
+
+wait_until() {
+
+	seconds="${3:-120}"
+	echo "Info: Waiting up to ${seconds} seconds for ${2} signal from ${1}."
+	# shellcheck disable=SC2034
+	for try in $(seq "${seconds}") ; do
+		if [ -e "/sut/${1}.${2}" ]; then
+			signal="$(cat "/sut/${1}.${2}")"
+			msg="Received ${2} signal."
+			[ -n "${signal}" ] && msg="Received '${signal}' in ${2} signal."
+			break
+		fi
+		[ -e "/sut/${1}.failed" ] && abort
+		sleep 1s
+	done
+	return 0
+}
+
+# Remove the status files.
+
+rm -f /sut/samba.start
+rm -f /sut/samba.stop
+rm -f /sut/samba.stopped
+rm -f /sut/samba.ready
+rm -f /sut/samba.failed
+rm -f /sut/files.start
+rm -f /sut/files.stop
+rm -f /sut/files.stopped
+rm -f /sut/files.ready
+rm -f /sut/files.failed
+
+# Install needed tools and utilities.
+install="dnf install -y"
+[ -e /usr/bin/apt-get ] && install="apt-get install -y"
+[ -e /usr/bin/apt-get ] && apt-get update
+packages="samba-tools cifs-utils samba-ldb-ldap-modules"
+[ -e /usr/bin/apt-get ] && packages="samba-common-bin cifs-utils smbldap-tools"
+[ -e /usr/bin/apt-get ] && packages="samba-common-bin cifs-utils"
+[ -e /usr/bin/apt-get ] && packages="samba-common-bin cifs-utils smbldap-tools"
+# shellcheck disable=SC2086
+$install $packages
+
+# Wait until the samba domain controller is ready.
+wait_until samba ready
+
+echo "${signal}" >/sut/files.start
+
+echo "Info: Active Directory Domain Controller IP is ${signal}"
+# Resolve dns queries via the test domain controller.
+echo "search samdom.example.com"  >/etc/resolv.conf
+echo "nameserver ${signal}"      >>/etc/resolv.conf
+
+# Wait until the file server is ready and get its host IP for the cifs mounts.
+wait_until files ready
+files="${signal}"
+echo "Info: Samba File Server IP is ${files}"
+
+echo "Running tests..."
+
+# Add user(s) for testing.
+#amba-tool user create testy 'Passw0rd' --URL=ldap://samba.samdom.example.com --username=Administrator --password=Passw0rd \
+samba-tool user create testy 'Passw0rd' -H ldap://samba.samdom.example.com -Uadministrator%Passw0rd \
+  --given-name	'Test' \
+  --initials	'E' \
+  --surname	'User' \
+  --unix-home=/sut/testy \
+  --uid-number=10003 \
+  --gid-number=10004 \
+  --nis-domain=samdom \
+  --login-shell=/bin/bash || rc="$?"
+log_test "User 'testy' add"
+
+samba-tool group listmembers "Domain Users" -H ldap://samba.samdom.example.com -Uadministrator%Passw0rd || rc="$?"
+log_test "List members of 'Domain Users'"
+
+# Remove any orphaned results.
+rm -f /sut/share/*
+
+rc="1"
+echo
+echo "Info: Doing mount for user Administrator."
+if mount -t cifs -o username=Administrator,password=Passw0rd,domain=samdom.example.com "//${files}/share" /mnt ; then
+	echo "Administrator Text!" >/mnt/Administrator.txt
+	umount -t cifs /mnt
+fi
+[ "$(cat /sut/share/Administrator.txt 2>/dev/null)" = "Administrator Text!" ] && rc="0"
+log_test "User 'Administrator' write"
+cat /sut/share/Administrator.txt
+
+rc="1"
+echo
+echo "Info: Doing mount for user testy."
+if mount -t cifs -o username=testy,password=Passw0rd,domain=samdom.example.com "//${files}/share" /mnt ; then
+	echo "testy Text!" >/mnt/testy.txt
+	umount -t cifs /mnt
+fi
+[ "$(cat /sut/share/testy.txt 2>/dev/null)" = "testy Text!" ] && rc="0"
+log_test "User 'testy' write"
+cat /sut/share/testy.txt
+
+echo
+echo "Directory listing for local share: "
+ls -lR /sut/share
+echo
+
+report_test_stats
+
+quit
+
+wait_until files stopped 30
+wait_until samba stopped 30
+
+rc="0"
+[ $errs -gt 0 ] && rc="1"
+echo "Bye, bye, with rc = ${rc}."
+
+exit $rc
+

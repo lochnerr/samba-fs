@@ -1,0 +1,50 @@
+version: "2"
+
+# Test the provision-file-server script that configures a Samba File Server with Active Directory integration.
+
+services:
+
+  samba:
+    image: lochnerr/systemd:${DISTRO:-fedora}-${RELEASE:-latest}
+    command: run-service samba-active-directory-instance
+    # Provisioning an active directory domain controller must be run in a root container with docker privileged.
+    privileged: true
+    restart: "no"
+    hostname: samba.samdom.example.com
+    volumes:
+      - test-samba:/sut
+      - $PWD/bin:/usr/local/bin:ro
+    environment:
+      INIT: $INIT
+
+  files:
+    image: lochnerr/systemd:${DISTRO:-fedora}-${RELEASE:-latest}
+    command: run-service provision-file-server samdom.example.com SAMDOM "Passw0rd"
+    restart: "no"
+    cap_add:
+      - SYS_ADMIN
+    hostname: files.samdom.example.com
+    volumes:
+      - test-samba:/sut
+      - $PWD/bin:/usr/local/bin:ro
+    environment:
+      INIT: $INIT
+      # If this is true or yes, a samba-tool join will be done rather than a realm join.
+      SAMBA_JOIN: $SAMBA_JOIN
+
+  sut:
+    image: ${DISTRO:-fedora}:${RELEASE:-latest}
+    command: system-unit-tests
+    restart: "no"
+    # To do cifs mounts for testing in a container requires these capabilities.
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    hostname: sut.samdom.example.com
+    volumes:
+      - test-samba:/sut
+      - $PWD/bin:/usr/local/bin:ro
+
+volumes:
+  test-samba:
+

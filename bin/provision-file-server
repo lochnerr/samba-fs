@@ -1,0 +1,263 @@
+#!/bin/bash
+
+# provision-file-server: Provision a Samba file server for an Active Directory Domain using realm to join the domain.
+
+# Run the samba-tool join version, if requested.
+if echo "${SAMBA_JOIN}" | grep -Ei '^yes$|^ye$|^y$|^true$|^tru$|^tr$|^t$' >/dev/null 2>&1 ; then
+	provision-file-server-samba "$@"
+	exit 0
+fi
+
+if [ 0 != "$(id -u)" ]; then
+	echo "Must be root!"
+	exit 1
+fi
+
+if [ -z "$2" ]; then
+	echo "Format: $(basename "$0") REALM WORKGROUP [Password]"
+	exit 1
+fi
+
+if ! grep -iq "$1" 2>/dev/null /proc/sys/kernel/hostname ; then
+	echo "Error: Hostname '$(cat /proc/sys/kernel/hostname)' is not in the realm '$1'."
+	exit 1
+fi
+
+start_time="$(date -u +%s)"
+
+# This is only used in testing.
+wait_for_file() {
+
+	seconds="${2:-120}"
+	echo "Info: Waiting up to ${seconds} seconds for signal file ${1}."
+	# shellcheck disable=SC2034
+	for try in $(seq "${seconds}") ; do
+		[ -e "${1}" ] && break
+		sleep 1s
+	done
+}
+
+# Mirror script output to log file (Note: this requires explicit #!/bin/bash on Debian/Ubuntu).
+# shellcheck disable=SC3020,SC3001
+exec &> >(tee -a /var/log/"$(basename "$0").log")
+
+# TODO Figure out a better way to deal with PASSWORD.
+REALM="$(echo "$1" | tr '[:lower:]' '[:upper:]')"
+domain="$(echo "${REALM}" | tr '[:upper:]' '[:lower:]')"
+WORKGROUP="$2"
+[ -n "$3" ] && PASSWORD="$3"
+
+install="dnf install -y"
+[ -e /usr/bin/apt-get ] && install="apt-get install -y"
+
+# If this is a system unit test run, wait for the active directory start signal, then configure the resolver.
+if [ "$(cut -d. -f2- </proc/sys/kernel/hostname)" = "samdom.example.com" ]; then
+	# Install iproute (needed to determine the host's ip address).
+	packages="iproute"
+	[ -e /usr/bin/apt-get ] && packages="iproute2"
+	$install $packages
+	IP="$(ip a | grep 'inet ' | grep -v 'inet 127' | awk '{print $2}' | cut -d/ -f1)"
+	# Make sure the unit test process has time to erase any orphaned start file.
+	sleep 1s
+	wait_for_file "/sut/files.start"
+	# Get the primary domain controller's IP value from the start file.
+	primary="$(cat "/sut/files.start" || :)"
+	echo "Info: Active Directory Domain Controller IP is ${primary}"
+	# Set the dns name server to the primary.
+	echo "search ${domain}"       >/etc/resolv.conf
+	echo "nameserver ${primary}" >>/etc/resolv.conf
+fi
+
+# Install bind-utils to get the host command.
+packages="bind-utils"
+[ -e /usr/bin/apt-get ] && packages="bind9utils bind9-host"
+# shellcheck disable=SC2086
+$install $packages
+
+# No point in continuing if unable to find an Active Directory Domain Controller for the REALM.
+if ! host -t SRV "_ldap._tcp.${domain}" >/dev/null 2>&1 ; then
+	echo "Error: Unable to find SRV record(s) for domain '${domain}'."
+	exit 1
+fi
+
+# Install the remaining components needed for the join.
+packages="realmd oddjob-mkhomedir samba-winbind-clients"
+[ -e /usr/bin/apt-get ] && packages="realmd samba winbind"
+# shellcheck disable=SC2086
+$install $packages
+
+# Add AD crypto support.
+if command -v update-crypto-policies >/dev/null 2>&1 ; then
+	echo "Info: Adding Active Directory support to crypto policies."
+	update-crypto-policies --set DEFAULT:AD-SUPPORT
+fi
+
+# NOTE: Not sure at all if this applies to member servers or just domain controllers.  Probably safe to do it in any event.
+# According to: https://fedoramagazine.org/samba-as-ad-and-domain-controller/
+# To run a Samba DC and running with SELinux in enforcing mode, it is necessary to set some samba booleans for SELinux to on:
+#   samba_create_home_dirs=on samba_domain_controller=on samba_enable_home_dirs=on samba_portmapper=on use_samba_home_dirs=on
+# For a simple Samba file server, it is unlikely that samba_domain_controller or samba_portmapper booleans are needed.
+if command -v setsebool >/dev/null 2>&1 ; then
+	echo "Info: Setting SELinux booleans for home directories."
+	setsebool -P samba_create_home_dirs=on samba_enable_home_dirs=on use_samba_home_dirs=on
+	# Only do restorecon if it is not a live image.
+	mount | grep -q /run/initramfs/live || restorecon -Rv /
+fi
+
+# Backup the original file, even if non-existent or empty.
+[ ! -e /etc/krb5.conf ] && touch /etc/krb5.conf
+[ ! -e /etc/krb5.conf.orig ] && cp -p /etc/krb5.conf /etc/krb5.conf.orig
+
+# Add libdefaults stanza, if needed.
+grep -q '\[libdefaults\]'  2>/dev/null /etc/krb5.conf || echo "[libdefaults]" >>/etc/krb5.conf
+
+# Add these options (in reverse order), if needed.
+sed -i /etc/krb5.conf -e '/^#.*default_realm/d'
+grep -q 'dns_lookup_kdc'   2>/dev/null /etc/krb5.conf || sed -i /etc/krb5.conf  -e '/\[libdefaults\]/a #tab dns_lookup_kdc = true'
+grep -q 'dns_lookup_realm' 2>/dev/null /etc/krb5.conf || sed -i /etc/krb5.conf  -e '/\[libdefaults\]/a #tab dns_lookup_realm = false'
+grep -q 'default_realm'    2>/dev/null /etc/krb5.conf || sed -i /etc/krb5.conf  -e "/\[libdefaults\]/a #tab default_realm = ${REALM}"
+grep -q 'udp_preference_'  2>/dev/null /etc/krb5.conf || sed -i /etc/krb5.conf  -e '/\[libdefaults\]/a #tab udp_preference_limit = 0'
+
+# Ensure the options are set correctly.
+sed -i /etc/krb5.conf -e "s/dns_lookup_kdc.*/dns_lookup_kdc = true/"
+sed -i /etc/krb5.conf -e "s/dns_lookup_realm.*/dns_lookup_realm = false/"
+sed -i /etc/krb5.conf -e "s/default_realm.*/default_realm = ${REALM}/"
+sed -i /etc/krb5.conf -e "s/udp_preference_limit.*/udp_preference_limit = 0/"
+
+# Add a comment and do some cleanup.
+sed -i  /etc/krb5.conf \
+ -e '/\[libdefaults\]/i # See: https://wiki.samba.org/index.php/Setting_up_Samba_as_a_Domain_Member#Configuring_Kerberos' \
+ -e '/^[[:space:]]*default_ccache_name[[:space:]]/d' \
+ -e 's/#tab /\t/' \
+ -e '/^#.*default_realm.*EXAMPLE.COM.*/d'
+
+# Show the changes.
+if command -v diff >/dev/null 2>&1 ; then
+	echo
+	echo "Info: Changes to /etc/krb5.conf:"
+	diff /etc/krb5.conf.orig /etc/krb5.conf
+	echo
+fi
+
+echo "Info: Backing up the smb.conf prior to joining."
+[ ! -e /etc/samba/smb.conf.orig ] && cp -p /etc/samba/smb.conf /etc/samba/smb.conf.orig
+
+echo "Info: Doing realm join to REALM: ${REALM}."
+systemctl is-active systemd-journald >/dev/null 2>&1 || opt="--install=/"
+# shellcheck disable=SC2086
+realm discover $opt "${REALM}"
+echo
+mkdir -p /run/samba
+echo "realm join -v --membership-software=samba --client-software=winbind $opt ${REALM}"
+# shellcheck disable=SC2086
+if ! echo "${PASSWORD}" | realm join -v --membership-software=samba --client-software=winbind $opt "${REALM}" ; then
+	echo "Warning: Domain Join to realm '${REALM}' encountered errors!"
+fi
+
+echo "Info: Changes to /etc/samba/smb.conf after join:"
+diff /etc/samba/smb.conf.orig /etc/samba/smb.conf
+
+# If not running under systemd, manually starting the winbind process is required.
+if ! systemctl is-active systemd-journald >/dev/null 2>&1 ; then
+	echo "Info: Starting the Samba winbind daemon."
+	# shellcheck disable=SC1091,SC2086
+	if [ -e /usr/bin/apt-get ]; then
+		[ -e /etc/default/samba ]   && . /etc/default/samba
+		/usr/sbin/winbindd --foreground --no-process-group $WINBINDOPTIONS &
+	else
+		[ -e /etc/sysconfig/samba ] && . /etc/sysconfig/samba
+		/usr/bin/winbindd --foreground --no-process-group "$WINBINDOPTIONS" &
+	fi
+	sleep 1s
+fi
+
+# Verify that the dc can be ping'ed.
+if ! wbinfo --ping-dc ; then
+	echo "Warning: Unable to ping domain controller."
+fi
+
+# Show the domains.
+wbinfo --all-domains
+
+# Verify that Active Directory entries can be found.
+if getent passwd "administrator@${REALM}" >/dev/null 2>&1 ; then
+	echo "Info: Able to get passwd entry for administrator@${REALM} account using getent."
+else
+	echo "Warning: Unable to get passwd entry for administrator@${REALM} account using getent."
+fi
+
+if  getent group "${WORKGROUP}\Domain Users" >/dev/null 2>&1 ; then
+	echo "Info: Able to get group entry for '${WORKGROUP}\Domain Users' account using getent."
+else
+	echo "Warning: Unable to get group entry for '${WORKGROUP}\Domain Users' account using getent."
+fi
+
+# Verify user/group modifications.
+touch /tmp/example.txt
+if chown "${WORKGROUP}\administrator":"${WORKGROUP}\Domain Users" /tmp/example.txt ; then
+	echo "Info: Windows Owner/Group change worked as expected."
+else
+	echo "Warning: Windows Owner/Group change did not work as expected."
+fi
+
+# If this is a test run, configure the test share and create its directory.
+if [ -d /sut ]; then
+	cat >>/etc/samba/smb.conf <<__EOD__
+
+[share]
+	comment = Share for All Domain Users
+	create mask = 0770
+	directory mask = 0770
+	guest ok = no
+	inherit acls = Yes
+	inherit permissions = Yes
+	path = /sut/share
+	read only = No
+	valid users = "@${WORKGROUP}\Domain Users"
+	write list = "@${WORKGROUP}\Domain Users"
+__EOD__
+
+	# Clean and create the test share directory.
+	rm -rf /sut/share
+	mkdir -p /sut/share
+	# From Chrome AI Query: setting up samba active directory share folder
+	chown -R root:"${WORKGROUP}\\Domain Users" /sut/share
+	chmod -R 770 /sut/share
+fi
+
+# Install samba to get smbd.
+$install samba
+
+# Start the Samba server message block daemon process.
+echo "Info: Starting the Samba smb daemon."
+if ! systemctl is-active systemd-journald >/dev/null 2>&1 ; then
+	# shellcheck disable=SC1091,SC2086
+	if [ -e /usr/bin/apt-get ]; then
+		[ -e /etc/default/samba ]   && . /etc/default/samba
+		/usr/sbin/smbd --foreground --no-process-group $SMBDOPTIONS &
+	else
+		[ -e /etc/sysconfig/samba ] && . /etc/sysconfig/samba
+		/usr/bin/smbd --foreground --no-process-group "$SMBDOPTIONS" &
+	fi
+else
+	[ -e /usr/bin/apt-get ] && SMB="smbd"
+	systemctl enable --now "${SMB:-smb}"
+fi
+
+# shellcheck disable=SC2181
+if [ "$?" = "0" ]; then
+	echo "Info: The Samba File Server is up and ready to process requests after $(($(date -u +%s) - start_time)) seconds."
+else
+	echo "Warning: The Samba smb daemon did not appear to start."
+fi
+
+# If this is a test run, set the status to ready and wait for the shutdown signal.
+if [ -d /sut ]; then
+	echo "$IP" >"/sut/files.ready"
+	wait_for_file "/sut/files.stop" "${wait_seconds:-90}"
+	: >"/sut/files.stopped"
+	systemctl is-active systemd-journald >/dev/null 2>&1 && kill -s "RTMIN+3" 1
+fi
+
+echo "Done!"
+
